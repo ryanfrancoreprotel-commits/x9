@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Reprotel Daily Audit",
+  "version": "8.0",
+  "description": "Audita reuniões Daily da Reprotel e envia a transcrição para o ClickUp",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://meet.google.com/*",
+    "https://calendar.google.com/*",
+    "https://n8n.reprotel.com.br/*"
+  ],
+  "action": {
+    "default_title": "Reprotel Daily Audit — clique para iniciar/parar a auditoria",
+    "default_icon": {
+      "16": "icon.png",
+      "32": "icon.png",
+      "48": "icon.png",
+      "128": "icon.png"
+    }
+  },
+  "icons": {
+    "16": "icon.png",
+    "32": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
