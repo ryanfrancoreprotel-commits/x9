@@ -64,6 +64,8 @@ reprotel-extension/
 - Captura **todos** (líder + participantes), em **texto**, com nomes. Sem áudio, sem arquivos grandes.
 - Depende das **legendas do Meet** estarem ligadas (a extensão tenta ligar sozinha; se não, ligue no **CC** / tecla **c**).
 - Os **seletores** das legendas do Meet mudam com o tempo. Se parar de capturar, use a mensagem `DUMP_CAPTIONS` (ou faça dump do `innerHTML` do container `.a4cQT`/`[jsname="dsyhDe"]`) pra reajustar.
+- **Alerta de captura travada:** enquanto grava, um monitor checa a cada ~30s se a legenda está ligada mas parou de vir fala nova por ~3,5 min (ou se o container de legenda sumiu). Se isso acontecer, o banner vira amarelo (`⚠️ parei de capturar…`) e o selo muda pra `!` — ligue as legendas (CC / tecla **c**) ou avise o suporte. Quando a fala volta, o alerta some sozinho e o selo REC retorna. Pausa real de reunião (ninguém falando) também dispara o aviso, mas ele some ao voltar a falar.
+- **Reenvio automático (outbox):** se o POST ao N8N falhar por rede, a transcrição **não se perde** — ela fica guardada em `chrome.storage.local` e é reenviada sozinha (no boot, num alarme de ~5min e após cada envio bem-sucedido) até dar certo. O N8N dedupa por `auditKey`, então reenviar é seguro.
 - Um clique no ícone alterna iniciar/parar; sair da chamada encerra sozinho.
 
 ### Campos enviados ao N8N

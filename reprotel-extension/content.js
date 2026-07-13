@@ -36,6 +36,26 @@ let committedKeys = new Set();
 let participantsSeen = new Set(); // nomes vistos durante a call (acumulado)
 let selfNameCache    = '';        // nome do líder (cacheado enquanto na call)
 
+// ── Monitor de saúde da captura ("captura silenciosamente quebrada") ──
+// Se o Google trocar os seletores do Meet, a extensão pode ficar com o selo REC
+// gravando ZERO sem ninguém perceber. Este monitor compara o crescimento do
+// transcript ao longo do tempo com o estado das legendas e alerta o líder no banner.
+let capHealthTimer   = null;      // interval do check contínuo
+let lastGrowthTs     = 0;         // timestamp da última fala nova (sinal "captura viva")
+let lastLineCount    = 0;         // último transcript.length observado pelo monitor
+let captureStalled   = false;     // estado atual do alerta (alterna o banner, evita log repetido)
+
+// STALL_MS: janela de silêncio antes de gritar por QUEBRA INEQUÍVOCA de seletor
+// (container/botão da legenda sumiram). Aqui 3.5min é seguro: se o seletor sumiu, sumiu.
+const STALL_MS           = 3.5 * 60 * 1000;
+// NOGROWTH_STALL_MS: janela SÓ pro caso "zero crescimento" (legenda ligada mas sem fala
+// nova). Silêncio numa daily real (alguém compartilhando tela, rodada terminada) NÃO é
+// quebra — por isso a janela é bem maior que a de quebra de seletor, pra não dar falso
+// alarme numa pausa legítima. Só vira alerta se, além do silêncio longo, houver com quem
+// falar na call (getParticipants().length > 1).
+const NOGROWTH_STALL_MS  = 9 * 60 * 1000;
+const HEALTH_INTERVAL_MS = 30 * 1000;   // frequência do check contínuo
+
 // Continuidade da sessão (sair e voltar = mesma reunião, não uma nova)
 let currentMeetingKey = '';       // meetingId|YYYY-MM-DD, congelada durante a call
 let persistTimer      = null;     // debounce da persistência em storage.local
@@ -45,12 +65,34 @@ let helloSent         = false;    // já anunciei presença (CONTENT_HELLO) nest
 
 // ── Leitura dos metadados ─────────────────────────────────────
 
+// Escapa metacaracteres de regex numa keyword antes de montar o RegExp.
+// Defensivo: as keywords atuais são só letras (cs, web, ads…), mas se um dia
+// entrar algo com ponto/parêntese/etc, isso evita quebrar o RegExp.
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Casa a keyword como PALAVRA INTEIRA (não substring). Usa lookaround Unicode:
+// o negative-lookbehind (?<![\p{L}\p{N}]) exige que o caractere ANTES da kw NÃO
+// seja letra/número; o negative-lookahead (?![\p{L}\p{N}]) exige o mesmo DEPOIS.
+// Por que não usar \b? O \b do JS é ASCII: ele trata ç/ú/õ como fronteira de
+// palavra, então "preçoconteudo" casaria "conteudo" por engano. Com \p{L}\p{N}
+// (flag u), acentos contam como parte da palavra e essa fronteira falsa some.
+// A flag i mantém o case-insensitive (o texto já vem em lower, mas fica redundante seguro).
+function hasWord(text, kw) {
+  const re = new RegExp('(?<![\\p{L}\\p{N}])' + escapeRegex(kw) + '(?![\\p{L}\\p{N}])', 'iu');
+  return re.test(text);
+}
+
 function detectTeam(title) {
   const lower = title.toLowerCase();
   for (const entry of TEAMS) {
+    // Palavra inteira em vez de substring: "Docs review" não vira mais CS,
+    // "Webinar" não vira Web, "roadmap" não vira Ads. A prioridade (ordem do
+    // TEAMS) e a regra matchAll de "CS Onboard" continuam intactas.
     const matched = entry.matchAll
-      ? entry.keywords.every(kw => lower.includes(kw))
-      : entry.keywords.some(kw => lower.includes(kw));
+      ? entry.keywords.every(kw => hasWord(lower, kw))
+      : entry.keywords.some(kw => hasWord(lower, kw));
     if (matched) return entry;
   }
   return null;
@@ -262,6 +304,9 @@ function commitLine(val) {
   if (committedKeys.has(key)) return;
   committedKeys.add(key);
   transcript.push({ speaker: val.speaker, text: val.text });
+  // Marca "a captura está viva": toda vez que uma fala nova é commitada, renova
+  // o relógio de frescor que o checkCaptureHealth() lê pra decidir se travou.
+  lastGrowthTs = Date.now();
   console.log('[Reprotel] fala:', (val.speaker ? val.speaker + ': ' : '') + val.text);
   if (isRecording) schedulePersist();
 }
@@ -291,7 +336,68 @@ function syncCaptions() {
     }
   }
   if (isRecording) {
-    showBanner('🔴 Reprotel — Transcrevendo a auditoria…', 'recording');
+    // Se o monitor detectou que a captura travou, mostra o alerta em vez do "recording".
+    // Precisa passar por aqui (via flag captureStalled) porque o capPoll roda a cada
+    // 700ms e sobrescreveria qualquer showBanner de aviso solto.
+    if (captureStalled) {
+      showBanner('⚠️ Reprotel — parei de capturar. Ligue as legendas (CC / tecla "c") ou avise o suporte.', 'warning');
+    } else {
+      showBanner('🔴 Reprotel — Transcrevendo a auditoria…', 'recording');
+    }
+  }
+}
+
+// Monitor contínuo de saúde da captura (roda a cada HEALTH_INTERVAL_MS enquanto grava).
+// É READ-ONLY sobre o DOM: não commita, não persiste, não toca em carência/envio/sequence.
+// Só decide se a captura travou e alterna o estado captureStalled (banner + telemetria).
+function checkCaptureHealth() {
+  // Fora de call ou sem gravar → não alerta (evita ruído na carência com o líder fora).
+  if (!isRecording || !isInCall()) return;
+
+  const now       = Date.now();
+  const container = findCapContainer();
+  const on        = captionsOn();
+  const button    = captionsButton();
+
+  // Rede extra: se o transcript cresceu desde o último check (caso commitLine mude
+  // de forma no futuro), renova o frescor por conta própria.
+  if (transcript.length > lastLineCount) lastGrowthTs = now;
+  lastLineCount = transcript.length;
+
+  // Alguma fala em andamento na tela AGORA também conta como sinal de vida
+  // (evita falso-positivo em monólogo longo que ainda não saiu da tela pra commitar).
+  let liveText = false;
+  for (const [, val] of blockText) { if (val && val.text) { liveText = true; break; } }
+
+  // Caso 1 — quebra de seletor: o botão diz que a legenda está LIGADA, mas o
+  // container de legenda sumiu (e/ou o próprio botão sumiu) há mais de STALL_MS.
+  const containerGone = on && !container && (now - lastGrowthTs > STALL_MS);
+  const buttonGone    = !button && !container && (now - lastGrowthTs > STALL_MS);
+
+  // Caso 2 — zero crescimento: legenda ligada, mas o transcript não cresce E não
+  // há fala em andamento em blockText há mais de NOGROWTH_STALL_MS. Se a legenda estiver
+  // DESLIGADA (on === false), NÃO é quebra: é opção do usuário (o capEnableRetry religa),
+  // então não dispara aqui.
+  // Anti-falso-positivo (daily silenciosa): silêncio só vira alerta se (1) passou a janela
+  // MAIOR (NOGROWTH_STALL_MS, não os 3.5min da quebra de seletor) E (2) há mais de 1
+  // participante na call — se o líder está sozinho, silêncio é esperado, não é captura quebrada.
+  const someoneToTalk = getParticipants().length > 1;
+  const noGrowth = on && !liveText && someoneToTalk && (now - lastGrowthTs > NOGROWTH_STALL_MS);
+
+  const stalled = containerGone || buttonGone || noGrowth;
+
+  if (stalled) {
+    if (!captureStalled) {
+      captureStalled = true;
+      console.warn('[Reprotel] Captura parece travada (sem falas novas há', Math.round((now - lastGrowthTs) / 1000), 's). Verifique as legendas do Meet.');
+      // Best-effort: pede pro background marcar o badge com "!". Não bloqueia nada.
+      chrome.runtime.sendMessage({ type: 'RECORDING_STALLED', meetingKey: meetingKey() }).catch(() => {});
+    }
+  } else if (captureStalled) {
+    // Voltou a capturar → limpa o alerta (o syncCaptions restaura o banner "recording").
+    captureStalled = false;
+    console.log('[Reprotel] Captura recuperada — voltando ao normal.');
+    chrome.runtime.sendMessage({ type: 'RECORDING_OK', meetingKey: meetingKey() }).catch(() => {});
   }
 }
 
@@ -426,6 +532,16 @@ function startCaptions(opts = {}) {
     }
   }, 8000);
 
+  // Baseline do monitor de saúde ao (re)começar a captura: zera o alerta e marca
+  // o frescor agora, pra uma sessão retomada não herdar um stall antigo nem gritar
+  // de cara mesmo com o transcript já cheio.
+  lastGrowthTs   = Date.now();
+  lastLineCount  = transcript.length;
+  captureStalled = false;
+  // Timer contínuo de saúde (o capCheckTimer de 8s acima é só o aviso de arranque).
+  if (capHealthTimer) clearInterval(capHealthTimer);
+  capHealthTimer = setInterval(checkCaptureHealth, HEALTH_INTERVAL_MS);
+
   return true;
 }
 
@@ -435,6 +551,10 @@ function stopCaptions() {
   if (capEnableRetry) { clearInterval(capEnableRetry); capEnableRetry = null; }
   if (capObserver) { capObserver.disconnect(); capObserver = null; }
   if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+  // Para o monitor de saúde e zera o alerta, pra não deixar o banner de warning
+  // grudado se depois começar outra sessão na mesma aba.
+  if (capHealthTimer) { clearInterval(capHealthTimer); capHealthTimer = null; }
+  captureStalled = false;
   finalizeCaptions();
   const text = buildTranscriptText();
   console.log('[Reprotel] Transcrição final:', transcript.length, 'falas,', text.length, 'caracteres');
@@ -451,7 +571,13 @@ async function beginCapture({ resume, meetingKeyFromBg }) {
   const restored = resume && transcript.length === 0 ? await restoreTranscript() : false;
   // resume nunca zera a memória (retomar = continuar); só START novo limpa.
   startCaptions({ keepState: resume || restored });
+  // Ao (re)começar, força o banner "recording" JÁ (startCaptions zerou captureStalled), sem
+  // esperar o próximo tick do capHealthTimer/capPoll. Cobre o reingresso via AUTO_START quando
+  // o badge/banner tinham ficado em "!" na sessão anterior — não deixa o alerta grudado.
   showBanner('🔴 Reprotel — Transcrevendo a auditoria…', 'recording');
+  // E reafirma pro background que a captura está OK (badge volta pra REC se estava em "!").
+  // O badgeIfActive do background ignora se não houver sessão ativa, então é seguro/idempotente.
+  chrome.runtime.sendMessage({ type: 'RECORDING_OK', meetingKey: meetingKey() }).catch(() => {});
   setupAutoStop();
 }
 

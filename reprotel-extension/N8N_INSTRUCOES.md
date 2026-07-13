@@ -36,6 +36,7 @@ mesma reunião.
   "hasTranscript": true,
   "sequenceNumber": 1,                       // nº do POST desta reunião (normalmente 1)
   "isFinal": true,
+  "deliveryId": null,                        // null no envio normal; id ESTÁVEL nos reenvios do outbox
   "timestamp": "2026-07-13T13:07:12Z",
   "transcript": "Ana: bom dia pessoal\nRai: bom dia...",  // texto pronto (compatível com o fluxo antigo)
   "lines": [                                 // estruturado, com hash por fala (p/ dedup no merge)
@@ -88,9 +89,33 @@ ENTRADA: payload do webhook
 Como só há 1 gravador, na prática o merge quase nunca dispara — mas ele garante que
 "carência expirou e o líder voltou depois" vire **1 task**, não 2.
 
+## Idempotência de reenvio (outbox) — `deliveryId`
+
+A extensão v9.0 tem um **outbox**: se o POST falhar por rede, o payload é guardado e
+**reenviado sozinho** depois. Isso cria um segundo tipo de duplicata, diferente do picote:
+**o MESMO envio pode chegar 2x** (ex.: o service worker morre entre o N8N responder `200` e
+a extensão remover o item do outbox → no próximo boot ela reenvia o mesmo payload).
+
+Pra isso, cada item de outbox leva um **`deliveryId` estável** (o mesmo em todos os reenvios
+daquele item). Regra no N8N:
+
+- Se `deliveryId` **não for null** e você já processou esse `deliveryId` antes → **ignore** (é reenvio).
+- No envio normal (caminho feliz), `deliveryId` vem `null` → processe normal.
+
+Ou seja, o N8N precisa de **duas** chaves:
+- `auditKey` → junta **pedaços diferentes** da mesma daily (o picote).
+- `deliveryId` → descarta **o mesmo pedaço chegando 2x** (o reenvio).
+
+## Itens "mortos" (`outbox:dead:*`)
+
+Se um item ficar **3 dias** sem conseguir enviar (N8N fora por muito tempo), a extensão
+**não apaga** — move pra uma chave `outbox:dead:*` no `chrome.storage.local` da máquina do
+líder e mostra um badge **ERR** vermelho. O suporte pode inspecionar e **repostar manualmente**
+o payload no webhook. Nada de transcrição some em silêncio.
+
 ## Passo a passo de setup
 
 1. Na lista de cada time no ClickUp, criar o custom field **`audit_key`** (texto).
-2. No workflow do webhook, inserir os nós: buscar-por-audit_key → IF existe → (create | append).
-3. Testar com 2 POSTs de mesmo `auditKey` (ver `README.md` → seção de verificação, teste 5):
-   deve virar **uma** task com as falas mescladas, sem linha repetida.
+2. No workflow do webhook, inserir os nós: dedup-por-`deliveryId` → buscar-por-`audit_key` → IF existe → (create | append).
+3. Testar com 2 POSTs de mesmo `auditKey` (ver `README.md` → verificação, teste 5): vira **uma** task, falas mescladas, sem linha repetida.
+4. Testar com 2 POSTs de mesmo `deliveryId` (não-null): o 2º deve ser **ignorado**.

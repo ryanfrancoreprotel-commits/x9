@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Reprotel Daily Audit",
-  "version": "8.0",
+  "version": "9.0",
   "description": "Audita reuniões Daily da Reprotel e envia a transcrição para o ClickUp",
   "permissions": [
     "activeTab",
